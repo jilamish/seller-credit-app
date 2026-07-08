@@ -1,0 +1,12 @@
+{
+  "name": "seller-credit-app",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "postinstall": "cd server && npm install && cd ../client && npm install && npm run build",
+    "start": "node server/index.js"
+  }
+}

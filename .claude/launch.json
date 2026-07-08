@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "seller-credit-app",
+      "runtimeExecutable": "C:\\Users\\Illa Mishra\\AppData\\Local\\nodejs-portable\\node-v22.14.0-win-x64\\node.exe",
+      "runtimeArgs": ["C:\\Users\\Illa Mishra\\Desktop\\seller-credit-app\\server\\index.js"],
+      "port": 8090
+    }
+  ]
+}

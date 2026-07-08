@@ -1,0 +1,10 @@
+run = "bash run.sh"
+entrypoint = "server/index.js"
+modules = ["nodejs-20"]
+
+[nix]
+channel = "stable-24_05"
+
+[[ports]]
+localPort = 8090
+externalPort = 80
