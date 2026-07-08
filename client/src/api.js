@@ -9,12 +9,17 @@ async function request(path, options) {
 }
 
 export const api = {
-  getSellers: () => request('/api/sellers'),
-  getSeller: (id) => request(`/api/sellers/${id}`),
-  createSeller: (payload) => request('/api/sellers', { method: 'POST', body: JSON.stringify(payload) }),
+  getPools: () => request('/api/pools'),
+
+  createLender: (payload) => request('/api/lenders', { method: 'POST', body: JSON.stringify(payload) }),
   getLenders: () => request('/api/lenders'),
-  getLoans: () => request('/api/loans'),
+  getLender: (id) => request(`/api/lenders/${id}`),
+  invest: (id, payload) => request(`/api/lenders/${id}/invest`, { method: 'POST', body: JSON.stringify(payload) }),
+
+  createBorrower: (payload) => request('/api/borrowers', { method: 'POST', body: JSON.stringify(payload) }),
+  getBorrowers: () => request('/api/borrowers'),
+  getBorrower: (id) => request(`/api/borrowers/${id}`),
+
   applyForLoan: (payload) => request('/api/loans', { method: 'POST', body: JSON.stringify(payload) }),
-  updateLoanStatus: (id, status) =>
-    request(`/api/loans/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }),
+  payInstallment: (id) => request(`/api/installments/${id}/pay`, { method: 'POST' }),
 };
