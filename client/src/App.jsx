@@ -1,78 +1,63 @@
-import { Navigate, Route, Routes } from 'react-router-dom'
-import { useAuth } from './AuthContext'
-import NavBar from './NavBar'
-import { Landing } from './pages/Marketing'
-import { Login, Register } from './pages/Auth'
-import Onboarding from './pages/Onboarding'
-import { ClosetGrid, ClosetItemDetail, SnapTag } from './pages/Closet'
-import { OccasionPicker, OccasionResults, OutfitDetail, Beauty, Nails } from './pages/Occasions'
-import { InfluencerList, Feed, RecreateLook, Trending, Notifications } from './pages/Influencers'
-import { GapAnalysis, BestPrice, LookComplete } from './pages/Gap'
-import Chat from './pages/Chat'
-
-function AppShell({ children }) {
-  return (
-    <>
-      <NavBar />
-      <div className="fg-shell-body">{children}</div>
-    </>
-  )
-}
-
-function Protected({ children }) {
-  const { user, loading } = useAuth()
-  if (loading) return <p className="fg-p-muted center" style={{ marginTop: 80 }}>Loading...</p>
-  if (!user) return <Navigate to="/login" replace />
-  if (!user.onboarded) return <Navigate to={`/onboarding/${user.onboardingStep}`} replace />
-  return <AppShell>{children}</AppShell>
-}
-
-function OnboardingRoute() {
-  const { user, loading } = useAuth()
-  if (loading) return <p className="fg-p-muted center" style={{ marginTop: 80 }}>Loading...</p>
-  if (!user) return <Navigate to="/login" replace />
-  return <Onboarding />
-}
-
-function PublicOnly({ children }) {
-  const { user, loading } = useAuth()
-  if (loading) return <p className="fg-p-muted center" style={{ marginTop: 80 }}>Loading...</p>
-  if (user) return <Navigate to={user.onboarded ? '/closet' : `/onboarding/${user.onboardingStep}`} replace />
-  return children
-}
+import { useState } from 'react'
+import { api } from './api'
+import PersonPicker from './PersonPicker'
+import BorrowerFlow from './BorrowerFlow'
+import LenderFlow from './LenderFlow'
+import OpsFlow from './OpsFlow'
+import HowItWorks from './HowItWorks'
 
 function App() {
+  const [tab, setTab] = useState('borrow')
+  const [lenderId, setLenderId] = useState(null)
+  const [borrowerId, setBorrowerId] = useState(null)
+
   return (
-    <Routes>
-      <Route path="/" element={<PublicOnly><Landing /></PublicOnly>} />
-      <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
-      <Route path="/register" element={<PublicOnly><Register /></PublicOnly>} />
-      <Route path="/onboarding/:step" element={<OnboardingRoute />} />
+    <div className="app">
+      <header className="topbar">
+        <h1>Community Credit</h1>
+        <p className="tagline">A peer-to-peer marketplace for money — lend what you can spare, borrow what you need</p>
+        <nav>
+          <button className={tab === 'borrow' ? 'active' : ''} onClick={() => setTab('borrow')}>Borrow</button>
+          <button className={tab === 'lend' ? 'active' : ''} onClick={() => setTab('lend')}>Lend</button>
+          <button className={tab === 'ops' ? 'active' : ''} onClick={() => setTab('ops')}>Ops &amp; Risk</button>
+          <button className={tab === 'how' ? 'active' : ''} onClick={() => setTab('how')}>How it works</button>
+        </nav>
+      </header>
 
-      <Route path="/closet" element={<Protected><ClosetGrid /></Protected>} />
-      <Route path="/closet/new" element={<Protected><SnapTag /></Protected>} />
-      <Route path="/closet/:id" element={<Protected><ClosetItemDetail /></Protected>} />
+      <main>
+        {tab === 'borrow' && !borrowerId && (
+          <PersonPicker
+            title="Get Instant Credit"
+            subtitle="Enter your name to shop and see your trust score."
+            ctaLabel="Continue"
+            createFn={api.createBorrower}
+            listFn={api.getBorrowers}
+            onSelect={setBorrowerId}
+          />
+        )}
+        {tab === 'borrow' && borrowerId && (
+          <BorrowerFlow borrowerId={borrowerId} onSwitchAccount={() => setBorrowerId(null)} />
+        )}
 
-      <Route path="/occasions" element={<Protected><OccasionPicker /></Protected>} />
-      <Route path="/occasions/:occasion" element={<Protected><OccasionResults /></Protected>} />
-      <Route path="/occasions/:occasion/outfit" element={<Protected><OutfitDetail /></Protected>} />
-      <Route path="/outfits/:id/beauty" element={<Protected><Beauty /></Protected>} />
-      <Route path="/outfits/:id/nails" element={<Protected><Nails /></Protected>} />
+        {tab === 'lend' && !lenderId && (
+          <PersonPicker
+            title="Start Lending"
+            subtitle="Enter your name to set up your lending portfolio."
+            ctaLabel="Continue"
+            createFn={api.createLender}
+            listFn={api.getLenders}
+            onSelect={setLenderId}
+          />
+        )}
+        {tab === 'lend' && lenderId && (
+          <LenderFlow lenderId={lenderId} onSwitchAccount={() => setLenderId(null)} />
+        )}
 
-      <Route path="/influencers" element={<Protected><InfluencerList /></Protected>} />
-      <Route path="/feed" element={<Protected><Feed /></Protected>} />
-      <Route path="/looks/:id/recreate" element={<Protected><RecreateLook /></Protected>} />
-      <Route path="/trending" element={<Protected><Trending /></Protected>} />
-      <Route path="/notifications" element={<Protected><Notifications /></Protected>} />
+        {tab === 'ops' && <OpsFlow />}
 
-      <Route path="/gap" element={<Protected><GapAnalysis /></Protected>} />
-      <Route path="/gap/:id/price" element={<Protected><BestPrice /></Protected>} />
-      <Route path="/gap/complete" element={<Protected><LookComplete /></Protected>} />
-
-      <Route path="/chat" element={<Protected><Chat /></Protected>} />
-
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+        {tab === 'how' && <HowItWorks />}
+      </main>
+    </div>
   )
 }
 
