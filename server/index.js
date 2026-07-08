@@ -1,542 +1,538 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, dbPathInfo } from './db.js';
+import multer from 'multer';
+import { db, dbPathInfo, uploadsPath } from './db.js';
+import { hashPassword, checkPassword, createSession, requireAuth, publicUser } from './auth.js';
+import { seedDatabase } from './seed.js';
+
+seedDatabase();
+
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
 
 const app = express();
 const PORT = process.env.PORT || 8090;
+const upload = multer({ dest: uploadsPath(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 app.use(express.json());
+app.use('/uploads', express.static(uploadsPath()));
 
-// ---------- helpers ----------
-
-function poolStats(poolId) {
-  const invested = db
-    .prepare('SELECT COALESCE(SUM(amount),0) AS v FROM investments WHERE pool_id = ?')
-    .get(poolId).v;
-  const deployed = db
-    .prepare(
-      `SELECT COALESCE(SUM(lf.amount),0) AS v
-       FROM loan_fundings lf JOIN loans l ON l.id = lf.loan_id
-       WHERE l.pool_id = ? AND l.status IN ('active','completed')`
-    )
-    .get(poolId).v;
-  const lenderCount = db
-    .prepare('SELECT COUNT(DISTINCT lender_id) AS c FROM investments WHERE pool_id = ?')
-    .get(poolId).c;
-  const loanCount = db.prepare("SELECT COUNT(*) AS c FROM loans WHERE pool_id = ? AND status IN ('active','completed')").get(poolId).c;
-  return { invested, deployed, available: Math.max(invested - deployed, 0), lenderCount, loanCount };
-}
-
-function creditLimitFor(trustScore) {
-  return Math.round((trustScore * 15) / 100) * 100;
-}
-
-function usedCreditFor(borrowerId) {
-  return db
-    .prepare("SELECT COALESCE(SUM(amount),0) AS v FROM loans WHERE borrower_id = ? AND status IN ('active','pending_review')")
-    .get(borrowerId).v;
-}
-
-function selectFundingPool(amount) {
-  const pools = db.prepare('SELECT * FROM pools ORDER BY target_rate_pct ASC').all();
-  for (const pool of pools) {
-    if (poolStats(pool.id).available >= amount) return pool;
-  }
-  return null;
-}
-
-// Splits `amount` across every lender currently invested in `pool`, proportional
-// to their share, then generates the installment schedule.
-function fundAndScheduleLoan(loanId, pool, amount, tenureMonths, installmentAmount, dueOffsets) {
-  const investors = db
-    .prepare('SELECT lender_id, SUM(amount) AS total FROM investments WHERE pool_id = ? GROUP BY lender_id HAVING total > 0')
-    .all(pool.id);
-  const poolTotal = investors.reduce((sum, i) => sum + i.total, 0);
-
-  const insertFunding = db.prepare('INSERT INTO loan_fundings (loan_id, lender_id, amount) VALUES (?, ?, ?)');
-  for (const inv of investors) {
-    const share = inv.total / poolTotal;
-    const fundingAmount = Math.round(amount * share * 100) / 100;
-    if (fundingAmount > 0) insertFunding.run(loanId, inv.lender_id, fundingAmount);
-  }
-
-  const insertInstallment = db.prepare(
-    'INSERT INTO installments (loan_id, seq_no, amount, due_offset_days) VALUES (?, ?, ?, ?)'
-  );
-  dueOffsets.forEach((offset, idx) => {
-    insertInstallment.run(loanId, idx + 1, installmentAmount, offset);
-  });
-
-  return investors.length;
-}
-
-function lenderInterestPerInstallment(loan, pool) {
-  if (!pool) return 0;
-  return (loan.amount * (pool.target_rate_pct / 100) * (loan.tenure_months / 12)) / loan.tenure_months;
-}
-
-function planTerms(plan, price) {
-  if (plan === '15day') return { tenureMonths: 1, fee: 0, dueOffsets: [15] };
-  if (plan === '3emi') return { tenureMonths: 3, fee: 0, dueOffsets: [30, 60, 90] };
-  if (plan === '6emi') return { tenureMonths: 6, fee: 30, dueOffsets: [30, 60, 90, 120, 150, 180] };
-  return null;
-}
+const OCCASIONS = ['Office', 'Date Night', 'Wedding Guest', 'Festive', 'Travel', 'Gym', 'WFH', 'Party'];
+const SUGGESTED_SHOES = {
+  Office: 'nude block heels', 'Date Night': 'strappy heels', 'Wedding Guest': 'strappy heels',
+  Festive: 'juttis', Travel: 'white sneakers', Gym: 'training shoes', WFH: 'slides', Party: 'strappy heels',
+};
 
 // ---------- health ----------
 
 app.get('/api/health', (req, res) => {
   try {
-    const tables = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-      .all()
-      .map((row) => row.name);
-
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((r) => r.name);
     const counts = {};
-    for (const table of ['pools', 'lenders', 'investments', 'borrowers', 'products', 'loans', 'loan_fundings', 'installments', 'ledger']) {
-      if (tables.includes(table)) {
-        counts[table] = db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get().c;
-      }
+    for (const t of ['users', 'closet_items', 'outfits', 'influencers', 'looks', 'products', 'gap_items', 'chat_messages']) {
+      if (tables.includes(t)) counts[t] = db.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get().c;
     }
-
-    res.json({
-      status: 'ok',
-      db: { path: dbPathInfo(), readable: true, tables, rowCounts: counts },
-      timestamp: new Date().toISOString(),
-    });
+    res.json({ status: 'ok', db: { path: dbPathInfo(), readable: true, tables, rowCounts: counts }, timestamp: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// ---------- pools ----------
+// ---------- auth ----------
 
-app.get('/api/pools', (req, res) => {
-  const pools = db.prepare('SELECT * FROM pools ORDER BY target_rate_pct ASC').all();
-  res.json(pools.map((p) => ({ ...p, stats: poolStats(p.id) })));
-});
-
-app.get('/api/pools/:id', (req, res) => {
-  const pool = db.prepare('SELECT * FROM pools WHERE id = ?').get(req.params.id);
-  if (!pool) return res.status(404).json({ status: 'error', message: 'Pool not found' });
-  const loans = db.prepare("SELECT amount FROM loans WHERE pool_id = ? AND status IN ('active','completed')").all(pool.id);
-  const avgLoan = loans.length ? loans.reduce((s, l) => s + l.amount, 0) / loans.length : 0;
-  const onTimePct = (() => {
-    const row = db
-      .prepare(
-        `SELECT
-           SUM(CASE WHEN i.status = 'paid' THEN 1 ELSE 0 END) AS paid,
-           COUNT(*) AS total
-         FROM installments i JOIN loans l ON l.id = i.loan_id
-         WHERE l.pool_id = ?`
-      )
-      .get(pool.id);
-    return row.total > 0 ? Math.round((row.paid / row.total) * 1000) / 10 : null;
-  })();
-  res.json({ ...pool, stats: poolStats(pool.id), borrowerCount: loans.length, avgLoan, onTimePct });
-});
-
-// ---------- lenders ----------
-
-app.post('/api/lenders', (req, res) => {
-  const { name } = req.body;
-  if (!name || !name.trim()) return res.status(400).json({ status: 'error', message: 'Name is required' });
-  const result = db.prepare('INSERT INTO lenders (name) VALUES (?)').run(name.trim());
-  res.status(201).json({ id: result.lastInsertRowid, name: name.trim() });
-});
-
-app.get('/api/lenders', (req, res) => {
-  res.json(db.prepare('SELECT * FROM lenders ORDER BY id DESC').all());
-});
-
-app.get('/api/lenders/:id', (req, res) => {
-  const lender = db.prepare('SELECT * FROM lenders WHERE id = ?').get(req.params.id);
-  if (!lender) return res.status(404).json({ status: 'error', message: 'Lender not found' });
-
-  const grossInvested = db.prepare('SELECT COALESCE(SUM(amount),0) AS v FROM investments WHERE lender_id = ?').get(lender.id).v;
-  const withdrawn = db
-    .prepare("SELECT COALESCE(SUM(amount),0) AS v FROM ledger WHERE lender_id = ? AND type = 'withdrawn'")
-    .get(lender.id).v;
-  const invested = grossInvested - withdrawn;
-  const deployed = db.prepare('SELECT COALESCE(SUM(amount),0) AS v FROM loan_fundings WHERE lender_id = ?').get(lender.id).v;
-  const returns = db
-    .prepare("SELECT COALESCE(SUM(amount),0) AS v FROM ledger WHERE lender_id = ? AND type = 'emi_collected'")
-    .get(lender.id).v;
-
-  const investments = db
-    .prepare(
-      `SELECT i.*, p.name AS pool_name, p.grade, p.target_rate_pct
-       FROM investments i JOIN pools p ON p.id = i.pool_id
-       WHERE i.lender_id = ? ORDER BY i.created_at DESC`
-    )
-    .all(lender.id);
-
-  const activity = db
-    .prepare('SELECT * FROM ledger WHERE lender_id = ? ORDER BY created_at DESC LIMIT 15')
-    .all(lender.id);
-
-  const repayRow = db
-    .prepare(
-      `SELECT SUM(CASE WHEN i.status = 'paid' THEN 1 ELSE 0 END) AS paid, COUNT(*) AS total
-       FROM installments i
-       JOIN loans l ON l.id = i.loan_id
-       JOIN loan_fundings lf ON lf.loan_id = l.id
-       WHERE lf.lender_id = ?`
-    )
-    .get(lender.id);
-  const onTimeRepaidPct = repayRow.total > 0 ? Math.round((repayRow.paid / repayRow.total) * 1000) / 10 : null;
-
-  const gradeRows = db
-    .prepare(
-      `SELECT p.grade, SUM(i.amount) AS amount
-       FROM investments i JOIN pools p ON p.id = i.pool_id
-       WHERE i.lender_id = ? GROUP BY p.grade`
-    )
-    .all(lender.id);
-  const allocation = gradeRows.map((g) => ({
-    grade: g.grade,
-    amount: g.amount,
-    pct: invested > 0 ? Math.round((g.amount / grossInvested) * 1000) / 10 : 0,
-  }));
-
-  res.json({
-    ...lender,
-    invested,
-    available: Math.max(invested - deployed, 0),
-    deployed,
-    returns,
-    returnPct: invested > 0 ? Math.round((returns / invested) * 1000) / 10 : 0,
-    currentValue: invested + returns,
-    loansFunded: db.prepare('SELECT COUNT(DISTINCT loan_id) AS c FROM loan_fundings WHERE lender_id = ?').get(lender.id).c,
-    onTimeRepaidPct,
-    allocation,
-    investments,
-    activity,
-  });
-});
-
-app.post('/api/lenders/:id/invest', (req, res) => {
+app.post('/api/auth/register', (req, res) => {
   try {
-    const { pool_id, amount } = req.body;
-    const lender = db.prepare('SELECT * FROM lenders WHERE id = ?').get(req.params.id);
-    const pool = db.prepare('SELECT * FROM pools WHERE id = ?').get(pool_id);
-    if (!lender || !pool) return res.status(404).json({ status: 'error', message: 'Lender or pool not found' });
-    if (!(Number(amount) >= 500)) {
-      return res.status(400).json({ status: 'error', message: 'Minimum investment is ₹500' });
-    }
+    const { email, password, name } = req.body;
+    if (!email || !password || !name) return res.status(400).json({ status: 'error', message: 'Name, email and password are required' });
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
+    if (existing) return res.status(400).json({ status: 'error', message: 'An account with this email already exists' });
 
-    db.prepare('INSERT INTO investments (lender_id, pool_id, amount) VALUES (?, ?, ?)').run(lender.id, pool.id, Number(amount));
-    db.prepare("INSERT INTO ledger (lender_id, type, amount, note) VALUES (?, 'invested', ?, ?)").run(
-      lender.id,
-      Number(amount),
-      `Added to ${pool.name}`
-    );
-
-    res.status(201).json({ status: 'ok' });
+    const result = db
+      .prepare('INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)')
+      .run(email.toLowerCase(), hashPassword(password), name);
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid);
+    const token = createSession(user.id);
+    res.status(201).json({ token, user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-app.post('/api/lenders/:id/withdraw', (req, res) => {
-  try {
-    const { amount } = req.body;
-    const lender = db.prepare('SELECT * FROM lenders WHERE id = ?').get(req.params.id);
-    if (!lender) return res.status(404).json({ status: 'error', message: 'Lender not found' });
-
-    const grossInvested = db.prepare('SELECT COALESCE(SUM(amount),0) AS v FROM investments WHERE lender_id = ?').get(lender.id).v;
-    const withdrawn = db
-      .prepare("SELECT COALESCE(SUM(amount),0) AS v FROM ledger WHERE lender_id = ? AND type = 'withdrawn'")
-      .get(lender.id).v;
-    const deployed = db.prepare('SELECT COALESCE(SUM(amount),0) AS v FROM loan_fundings WHERE lender_id = ?').get(lender.id).v;
-    const available = grossInvested - withdrawn - deployed;
-
-    if (Number(amount) > available) {
-      return res.status(400).json({ status: 'error', message: `Only ₹${Math.round(available).toLocaleString('en-IN')} is available to withdraw right now.` });
-    }
-
-    db.prepare("INSERT INTO ledger (lender_id, type, amount, note) VALUES (?, 'withdrawn', ?, 'Withdrawn to bank')").run(
-      lender.id,
-      Number(amount)
-    );
-
-    res.json({ status: 'ok' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get((email || '').toLowerCase());
+  if (!user || !checkPassword(password, user.password_hash)) {
+    return res.status(401).json({ status: 'error', message: 'Invalid email or password' });
   }
+  const token = createSession(user.id);
+  res.json({ token, user: publicUser(user) });
 });
 
-// ---------- products ----------
+app.get('/api/auth/me', requireAuth, (req, res) => res.json(publicUser(req.user)));
 
-app.get('/api/products', (req, res) => {
-  res.json(db.prepare('SELECT * FROM products').all());
+// ---------- onboarding ----------
+
+app.post('/api/onboarding/step', requireAuth, (req, res) => {
+  const { step, data } = req.body;
+  const u = req.user;
+  if (step === 1) db.prepare('UPDATE users SET style_tags = ? WHERE id = ?').run(JSON.stringify(data.styleTags || []), u.id);
+  if (step === 2) db.prepare('UPDATE users SET budget = ? WHERE id = ?').run(data.budget || null, u.id);
+  if (step === 3) db.prepare('UPDATE users SET platforms = ? WHERE id = ?').run(JSON.stringify(data.platforms || []), u.id);
+  if (step === 4) {
+    db.prepare('UPDATE users SET skin_tone = ?, undertone = ?, makeup_vibe = ? WHERE id = ?').run(
+      data.skinTone || null, data.undertone || null, JSON.stringify(data.makeupVibe || []), u.id
+    );
+  }
+  if (step === 5) db.prepare('UPDATE users SET declutter_notes = ? WHERE id = ?').run(data.declutterNotes || null, u.id);
+
+  const nextStep = step === 6 ? 6 : step + 1;
+  const onboarded = step === 6 ? 1 : 0;
+  db.prepare('UPDATE users SET onboarding_step = ?, onboarded = ? WHERE id = ?').run(nextStep, onboarded, u.id);
+
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(u.id);
+  res.json(publicUser(updated));
 });
 
-// ---------- borrowers ----------
+// ---------- closet ----------
 
-app.post('/api/borrowers', (req, res) => {
-  const { name } = req.body;
-  if (!name || !name.trim()) return res.status(400).json({ status: 'error', message: 'Name is required' });
-  const result = db.prepare('INSERT INTO borrowers (name) VALUES (?)').run(name.trim());
-  const borrower = db.prepare('SELECT * FROM borrowers WHERE id = ?').get(result.lastInsertRowid);
-  res.status(201).json({ ...borrower, creditLimit: creditLimitFor(borrower.trust_score), usedCredit: 0 });
+function itemToJson(item) {
+  return { ...item, occasion_tags: JSON.parse(item.occasion_tags || '[]'), costPerWear: item.times_worn > 0 ? Math.round(item.price / item.times_worn) : item.price };
+}
+
+app.get('/api/closet', requireAuth, (req, res) => {
+  const { category, occasion, q } = req.query;
+  let items = db.prepare('SELECT * FROM closet_items WHERE user_id = ? ORDER BY date_added DESC').all(req.user.id).map(itemToJson);
+  if (category && category !== 'All') items = items.filter((i) => i.category === category);
+  if (occasion) items = items.filter((i) => i.occasion_tags.includes(occasion));
+  if (q) {
+    const needle = q.toLowerCase();
+    items = items.filter((i) => [i.category, i.color_name, i.fabric, i.brand, i.vibe].some((f) => (f || '').toLowerCase().includes(needle)));
+  }
+  res.json({ items, total: db.prepare('SELECT COUNT(*) AS c FROM closet_items WHERE user_id = ?').get(req.user.id).c });
 });
 
-app.get('/api/borrowers', (req, res) => {
-  res.json(db.prepare('SELECT * FROM borrowers ORDER BY id DESC').all());
+app.get('/api/closet/:id', requireAuth, (req, res) => {
+  const item = db.prepare('SELECT * FROM closet_items WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!item) return res.status(404).json({ status: 'error', message: 'Item not found' });
+  res.json(itemToJson(item));
 });
 
-app.get('/api/borrowers/:id', (req, res) => {
-  const borrower = db.prepare('SELECT * FROM borrowers WHERE id = ?').get(req.params.id);
-  if (!borrower) return res.status(404).json({ status: 'error', message: 'Borrower not found' });
-
-  const loans = db
-    .prepare(
-      `SELECT l.*, p.name AS pool_name, p.grade, pr.name AS product_name
-       FROM loans l
-       LEFT JOIN pools p ON p.id = l.pool_id
-       LEFT JOIN products pr ON pr.id = l.product_id
-       WHERE l.borrower_id = ? ORDER BY l.created_at DESC`
-    )
-    .all(borrower.id)
-    .map((loan) => ({
-      ...loan,
-      installments: db.prepare('SELECT * FROM installments WHERE loan_id = ? ORDER BY seq_no ASC').all(loan.id),
-    }));
-
-  const usedCredit = usedCreditFor(borrower.id);
-  const limit = creditLimitFor(borrower.trust_score);
-
-  res.json({ ...borrower, creditLimit: limit, usedCredit, availableCredit: Math.max(limit - usedCredit, 0), loans });
-});
-
-app.post('/api/borrowers/:id/pan', (req, res) => {
-  const { pan } = req.body;
-  if (!pan || pan.trim().length < 4) return res.status(400).json({ status: 'error', message: 'Enter a valid PAN' });
-  const last4 = pan.trim().slice(-4).toUpperCase();
-  db.prepare('UPDATE borrowers SET pan_last4 = ? WHERE id = ?').run(last4, req.params.id);
-  res.json({ status: 'ok', pan_last4: last4 });
-});
-
-app.post('/api/borrowers/:id/aadhaar-otp', (req, res) => {
-  db.prepare('UPDATE borrowers SET aadhaar_verified = 1 WHERE id = ?').run(req.params.id);
+app.patch('/api/closet/:id/wear', requireAuth, (req, res) => {
+  db.prepare('UPDATE closet_items SET times_worn = times_worn + 1 WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
   res.json({ status: 'ok' });
 });
 
-// ---------- checkout / BNPL orders ----------
+const VIBE_POOL = ['Date Night', 'Office', 'Party', 'Festive', 'Travel'];
+const FABRIC_POOL = ['Satin', 'Cotton', 'Denim', 'Linen', 'Crepe', 'Wool'];
+const CATEGORY_POOL = ['Top', 'Bottom', 'Dress', 'Shoes', 'Bag', 'Outerwear'];
 
-app.post('/api/orders', (req, res) => {
+async function analyzeImage(filePath) {
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      const fs = await import('node:fs');
+      const imageData = fs.readFileSync(filePath).toString('base64');
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-3-5-haiku-20241022',
+          max_tokens: 200,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageData } },
+              { type: 'text', text: 'Identify this clothing item. Reply ONLY with compact JSON: {"category":"Top|Bottom|Dress|Shoes|Bag|Outerwear","color_name":"...","color_hex":"#rrggbb","fabric":"...","vibe":"..."}' },
+            ],
+          }],
+        }),
+      });
+      const json = await resp.json();
+      const text = json.content?.[0]?.text || '{}';
+      const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || '{}');
+      if (parsed.category) return parsed;
+    } catch (err) {
+      // fall through to mock
+    }
+  }
+  const seed = filePath.length;
+  return {
+    category: CATEGORY_POOL[seed % CATEGORY_POOL.length],
+    color_name: 'Fuchsia pink',
+    color_hex: '#ff1f7a',
+    fabric: FABRIC_POOL[seed % FABRIC_POOL.length],
+    vibe: VIBE_POOL[seed % VIBE_POOL.length],
+  };
+}
+
+app.post('/api/closet/analyze', requireAuth, upload.single('photo'), async (req, res) => {
   try {
-    const { borrower_id, product_id, plan } = req.body;
-    const borrower = db.prepare('SELECT * FROM borrowers WHERE id = ?').get(borrower_id);
-    const product = db.prepare('SELECT * FROM products WHERE id = ?').get(product_id);
-    const terms = planTerms(plan);
-    if (!borrower || !product || !terms) return res.status(404).json({ status: 'error', message: 'Invalid order request' });
-    if (!borrower.aadhaar_verified) {
-      return res.status(400).json({ status: 'error', message: 'Complete KYC verification first' });
-    }
+    if (!req.file) return res.status(400).json({ status: 'error', message: 'No photo uploaded' });
+    const tags = await analyzeImage(req.file.path);
+    const goesWith = db
+      .prepare('SELECT * FROM closet_items WHERE user_id = ?')
+      .all(req.user.id)
+      .filter((i) => JSON.parse(i.occasion_tags || '[]').includes(tags.vibe)).length;
 
-    const amount = product.price;
-    const limit = creditLimitFor(borrower.trust_score);
-    const used = usedCreditFor(borrower.id);
-    if (used + amount > limit) {
-      return res.status(400).json({ status: 'error', message: `Exceeds your available credit of ₹${Math.max(limit - used, 0).toLocaleString('en-IN')}` });
-    }
-
-    const installmentAmount = Math.round((amount + terms.fee) / terms.tenureMonths);
-    const planLabel = plan === '15day' ? 'Pay in 15 days' : plan === '3emi' ? '3 monthly EMIs' : '6 monthly EMIs';
-
-    const needsReview = borrower.trust_score < 600 || amount > limit * 0.8;
-
-    const insertLoan = db.prepare(
-      `INSERT INTO loans (borrower_id, product_id, amount, fee, purpose, plan_label, tenure_months, installment_amount, status)
-       VALUES (?, ?, ?, ?, 'Shopping', ?, ?, ?, ?)`
-    );
-    const loanId = insertLoan.run(
-      borrower.id,
-      product.id,
-      amount,
-      terms.fee,
-      planLabel,
-      terms.tenureMonths,
-      installmentAmount,
-      needsReview ? 'pending_review' : 'active'
-    ).lastInsertRowid;
-
-    if (needsReview) {
-      return res.status(202).json({ status: 'pending_review', id: loanId, message: 'Your application needs a quick manual review. Check back shortly.' });
-    }
-
-    const pool = selectFundingPool(amount);
-    if (!pool) {
-      db.prepare("UPDATE loans SET status = 'declined' WHERE id = ?").run(loanId);
-      return res.status(400).json({ status: 'error', message: 'No lender capacity available right now — please try again later.' });
-    }
-    db.prepare('UPDATE loans SET pool_id = ? WHERE id = ?').run(pool.id, loanId);
-    const fundedBy = fundAndScheduleLoan(loanId, pool, amount, terms.tenureMonths, installmentAmount, terms.dueOffsets);
-
-    res.status(201).json({
-      status: 'active',
-      id: loanId,
-      amount,
-      fee: terms.fee,
-      installmentAmount,
-      tenureMonths: terms.tenureMonths,
-      planLabel,
-      fundedBy,
+    res.json({
+      imagePath: `/uploads/${path.basename(req.file.path)}`,
+      suggested: { ...tags, occasion_tags: [tags.vibe] },
+      goesWith,
     });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-app.post('/api/installments/:id/pay', (req, res) => {
+app.post('/api/closet', requireAuth, (req, res) => {
   try {
-    const installment = db.prepare('SELECT * FROM installments WHERE id = ?').get(req.params.id);
-    if (!installment) return res.status(404).json({ status: 'error', message: 'Installment not found' });
-    if (installment.status === 'paid') return res.status(400).json({ status: 'error', message: 'Already paid' });
-
-    const loan = db.prepare('SELECT * FROM loans WHERE id = ?').get(installment.loan_id);
-    const pool = loan.pool_id ? db.prepare('SELECT * FROM pools WHERE id = ?').get(loan.pool_id) : null;
-
-    db.prepare("UPDATE installments SET status = 'paid', paid_at = datetime('now') WHERE id = ?").run(installment.id);
-
-    const interestPerInstallment = lenderInterestPerInstallment(loan, pool);
-    const fundings = db.prepare('SELECT * FROM loan_fundings WHERE loan_id = ?').all(loan.id);
-    const insertLedger = db.prepare(
-      "INSERT INTO ledger (lender_id, loan_id, type, amount, note) VALUES (?, ?, 'emi_collected', ?, ?)"
-    );
-    for (const f of fundings) {
-      const share = f.amount / loan.amount;
-      const credit = Math.round(interestPerInstallment * share * 100) / 100;
-      if (credit > 0) insertLedger.run(f.lender_id, loan.id, credit, `EMI collected · ${pool ? pool.name : 'loan'}`);
-    }
-
-    const borrower = db.prepare('SELECT * FROM borrowers WHERE id = ?').get(loan.borrower_id);
-    const newTrust = Math.min(borrower.trust_score + 5, 900);
-    db.prepare('UPDATE borrowers SET trust_score = ? WHERE id = ?').run(newTrust, borrower.id);
-
-    const remaining = db.prepare("SELECT COUNT(*) AS c FROM installments WHERE loan_id = ? AND status != 'paid'").get(loan.id).c;
-    if (remaining === 0) {
-      db.prepare("UPDATE loans SET status = 'completed' WHERE id = ?").run(loan.id);
-    }
-
-    res.json({ status: 'ok', trustScore: newTrust, loanCompleted: remaining === 0 });
+    const { imagePath, category, color_name, color_hex, fabric, vibe, occasion_tags, brand, price, care_instructions } = req.body;
+    const result = db
+      .prepare(
+        `INSERT INTO closet_items (user_id, image_path, category, color_name, color_hex, fabric, vibe, occasion_tags, brand, price, care_instructions)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(req.user.id, imagePath || null, category, color_name, color_hex || '#cf9d4f', fabric, vibe, JSON.stringify(occasion_tags || []), brand || null, Number(price) || 0, care_instructions || null);
+    res.status(201).json(itemToJson(db.prepare('SELECT * FROM closet_items WHERE id = ?').get(result.lastInsertRowid)));
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// ---------- ops: underwriting & collections ----------
+// ---------- weather ----------
 
-app.get('/api/ops/queue', (req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT l.*, b.name AS borrower_name, b.trust_score
-       FROM loans l JOIN borrowers b ON b.id = l.borrower_id
-       WHERE l.status = 'pending_review'
-       ORDER BY l.created_at ASC`
-    )
-    .all();
+app.get('/api/weather', async (req, res) => {
+  try {
+    const resp = await fetch('https://api.open-meteo.com/v1/forecast?latitude=19.076&longitude=72.877&current=temperature_2m,relative_humidity_2m,weather_code');
+    const json = await resp.json();
+    const temp = Math.round(json.current?.temperature_2m ?? 30);
+    const humidity = json.current?.relative_humidity_2m ?? 60;
+    const tip = humidity > 65 ? 'humid — breathable picks first.' : temp > 32 ? 'hot — go light & loose.' : 'pleasant — anything works today.';
+    res.json({ city: 'Mumbai', temp, humidity, tip });
+  } catch (err) {
+    res.json({ city: 'Mumbai', temp: 31, humidity: 70, tip: 'humid — breathable picks first.' });
+  }
+});
 
-  const queue = rows.map((loan) => {
-    const priorCompleted = db
-      .prepare("SELECT COUNT(*) AS c FROM loans WHERE borrower_id = ? AND status = 'completed'")
-      .get(loan.borrower_id).c;
-    const limit = creditLimitFor(loan.trust_score);
-    const flags = [];
-    if (loan.trust_score < 600) flags.push('Low score');
-    if (priorCompleted === 0) flags.push('Thin file');
-    if (loan.amount > limit * 0.9) flags.push('High utilisation');
+// ---------- occasion / outfit generation ----------
 
-    return { ...loan, limit, flags };
+function outfitSlots(items, occasion) {
+  const matches = items.filter((i) => JSON.parse(i.occasion_tags || '[]').includes(occasion));
+  return {
+    tops: matches.filter((i) => i.category === 'Top'),
+    bottoms: matches.filter((i) => i.category === 'Bottom'),
+    dresses: matches.filter((i) => i.category === 'Dress'),
+    shoes: matches.filter((i) => i.category === 'Shoes'),
+    bags: matches.filter((i) => i.category === 'Bag'),
+    outerwear: matches.filter((i) => i.category === 'Outerwear'),
+  };
+}
+
+function buildOutfitCombos(items, occasion) {
+  const slots = outfitSlots(items, occasion);
+  const combos = [];
+  const NAMES = ['Crisp & classic', 'Soft power', 'Effortless edit', 'Golden hour', 'Main character'];
+
+  slots.dresses.slice(0, 2).forEach((dress, idx) => {
+    const shoe = slots.shoes[idx % Math.max(slots.shoes.length, 1)];
+    const bag = slots.bags[idx % Math.max(slots.bags.length, 1)];
+    const parts = { Dress: dress, Shoes: shoe, Bag: bag };
+    combos.push(buildCombo(parts, occasion, NAMES[combos.length % NAMES.length]));
   });
 
+  slots.tops.slice(0, 2).forEach((top, idx) => {
+    const bottom = slots.bottoms[idx % Math.max(slots.bottoms.length, 1)];
+    const shoe = slots.shoes[idx % Math.max(slots.shoes.length, 1)];
+    const bag = slots.bags[idx % Math.max(slots.bags.length, 1)];
+    const parts = { Top: top, Bottom: bottom, Shoes: shoe, Bag: bag };
+    combos.push(buildCombo(parts, occasion, NAMES[combos.length % NAMES.length]));
+  });
+
+  return combos.sort((a, b) => b.matchScore - a.matchScore).slice(0, 3);
+}
+
+function buildCombo(parts, occasion, name) {
+  const slotNames = Object.keys(parts);
+  const filled = slotNames.filter((k) => parts[k]);
+  const missingSlot = slotNames.find((k) => !parts[k]);
+  const matchScore = Math.round((filled.length / slotNames.length) * 100);
+  return {
+    name,
+    occasion,
+    items: filled.map((k) => ({ slot: k, ...itemToJson(parts[k]) })),
+    matchScore,
+    missingItem: missingSlot ? (SUGGESTED_SHOES[occasion] && missingSlot === 'Shoes' ? SUGGESTED_SHOES[occasion] : `a ${missingSlot.toLowerCase()}`) : null,
+  };
+}
+
+app.get('/api/occasions', (req, res) => res.json(OCCASIONS));
+
+app.get('/api/occasions/:occasion/outfits', requireAuth, (req, res) => {
+  const items = db.prepare('SELECT * FROM closet_items WHERE user_id = ?').all(req.user.id);
+  const combos = buildOutfitCombos(items, req.params.occasion);
+  res.json(combos);
+});
+
+app.post('/api/outfits', requireAuth, (req, res) => {
+  const { name, occasion, itemIds, matchScore, missingItem } = req.body;
+  const result = db
+    .prepare('INSERT INTO outfits (user_id, name, occasion, item_ids, match_score, missing_item, saved) VALUES (?, ?, ?, ?, ?, ?, 1)')
+    .run(req.user.id, name, occasion, JSON.stringify(itemIds || []), matchScore || 0, missingItem || null);
+  res.status(201).json({ id: result.lastInsertRowid });
+});
+
+app.get('/api/outfits/:id', requireAuth, (req, res) => {
+  const outfit = db.prepare('SELECT * FROM outfits WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!outfit) return res.status(404).json({ status: 'error', message: 'Outfit not found' });
+  const itemIds = JSON.parse(outfit.item_ids || '[]');
+  const items = itemIds.map((id) => itemToJson(db.prepare('SELECT * FROM closet_items WHERE id = ?').get(id))).filter(Boolean);
+  res.json({ ...outfit, items });
+});
+
+app.post('/api/outfits/:id/wear', requireAuth, (req, res) => {
+  const outfit = db.prepare('SELECT * FROM outfits WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!outfit) return res.status(404).json({ status: 'error', message: 'Outfit not found' });
+  const itemIds = JSON.parse(outfit.item_ids || '[]');
+  const bump = db.prepare('UPDATE closet_items SET times_worn = times_worn + 1 WHERE id = ?');
+  itemIds.forEach((id) => bump.run(id));
+  db.prepare("UPDATE outfits SET worn_at = datetime('now') WHERE id = ?").run(outfit.id);
+  res.json({ status: 'ok' });
+});
+
+// ---------- beauty pairing ----------
+
+app.get('/api/outfits/:id/makeup', requireAuth, (req, res) => {
+  const outfit = db.prepare('SELECT * FROM outfits WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!outfit) return res.status(404).json({ status: 'error', message: 'Outfit not found' });
+  const undertone = req.user.undertone || 'Warm';
+  const products = db.prepare('SELECT * FROM products WHERE category = ? AND (undertone = ? OR undertone IS NULL) LIMIT 3').all('makeup', undertone);
+  const style = undertone === 'Warm' ? 'Soft glam, warm bronze' : undertone === 'Cool' ? 'Soft glam, cool mauve' : 'Soft glam, neutral rose';
   res.json({
-    pending: queue,
-    autoApprovedToday: db.prepare("SELECT COUNT(*) AS c FROM loans WHERE status IN ('active','completed')").get().c,
+    style,
+    description: `Dewy base, ${undertone === 'Warm' ? 'bronze smoked liner, a your-lips-but-better berry' : 'rose-taupe liner, a your-lips-but-better mauve'}. Made for your ${undertone.toLowerCase()} undertone.`,
+    products,
   });
 });
 
-app.post('/api/ops/loans/:id/decision', (req, res) => {
-  try {
-    const { action, amount } = req.body;
-    const loan = db.prepare('SELECT * FROM loans WHERE id = ?').get(req.params.id);
-    if (!loan) return res.status(404).json({ status: 'error', message: 'Application not found' });
-    if (loan.status !== 'pending_review') return res.status(400).json({ status: 'error', message: 'Already decided' });
+app.get('/api/outfits/:id/nails', requireAuth, (req, res) => {
+  const outfit = db.prepare('SELECT * FROM outfits WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!outfit) return res.status(404).json({ status: 'error', message: 'Outfit not found' });
+  const products = db.prepare('SELECT * FROM products WHERE category = ? ORDER BY premium ASC LIMIT 3').all('nail');
+  res.json({ products });
+});
 
-    if (action === 'decline') {
-      db.prepare("UPDATE loans SET status = 'declined' WHERE id = ?").run(loan.id);
-      return res.json({ status: 'declined' });
+// ---------- influencers ----------
+
+app.get('/api/influencers', requireAuth, (req, res) => {
+  const { q } = req.query;
+  let list = db.prepare('SELECT * FROM influencers').all();
+  if (q) list = list.filter((i) => i.name.toLowerCase().includes(q.toLowerCase()) || i.handle.toLowerCase().includes(q.toLowerCase()));
+  const follows = new Set(db.prepare('SELECT influencer_id FROM user_follows WHERE user_id = ?').all(req.user.id).map((r) => r.influencer_id));
+  res.json(list.map((i) => ({ ...i, following: follows.has(i.id) })));
+});
+
+app.post('/api/influencers/:id/follow', requireAuth, (req, res) => {
+  const existing = db.prepare('SELECT 1 FROM user_follows WHERE user_id = ? AND influencer_id = ?').get(req.user.id, req.params.id);
+  if (existing) {
+    db.prepare('DELETE FROM user_follows WHERE user_id = ? AND influencer_id = ?').run(req.user.id, req.params.id);
+    res.json({ following: false });
+  } else {
+    db.prepare('INSERT INTO user_follows (user_id, influencer_id) VALUES (?, ?)').run(req.user.id, req.params.id);
+    res.json({ following: true });
+  }
+});
+
+function matchAgainstCloset(descriptions, closetItems) {
+  const haystacks = closetItems.map((i) => `${i.category} ${i.color_name} ${i.fabric} ${i.vibe} ${i.brand}`.toLowerCase());
+  return descriptions.map((desc) => {
+    const words = desc.toLowerCase().split(/\s+/);
+    const owned = closetItems.find((i, idx) => words.some((w) => w.length > 3 && haystacks[idx].includes(w)));
+    return { description: desc, owned: !!owned, ownedItem: owned ? itemToJson(owned) : null };
+  });
+}
+
+app.get('/api/feed', requireAuth, (req, res) => {
+  const followedIds = db.prepare('SELECT influencer_id FROM user_follows WHERE user_id = ?').all(req.user.id).map((r) => r.influencer_id);
+  const closetItems = db.prepare('SELECT * FROM closet_items WHERE user_id = ?').all(req.user.id);
+  const looks = followedIds.length
+    ? db.prepare(`SELECT l.*, i.handle, i.name AS influencer_name FROM looks l JOIN influencers i ON i.id = l.influencer_id WHERE l.influencer_id IN (${followedIds.map(() => '?').join(',')})`).all(...followedIds)
+    : [];
+
+  const scored = looks.map((look) => {
+    const descs = JSON.parse(look.item_descriptions || '[]');
+    const matched = matchAgainstCloset(descs, closetItems);
+    const ownedCount = matched.filter((m) => m.owned).length;
+    const score = descs.length ? Math.max(35, Math.round((ownedCount / descs.length) * 100)) : 50;
+    return { ...look, item_descriptions: descs, matchScore: score };
+  });
+
+  res.json(scored);
+});
+
+app.get('/api/looks/:id/recreate', requireAuth, (req, res) => {
+  const look = db.prepare('SELECT l.*, i.handle, i.name AS influencer_name FROM looks l JOIN influencers i ON i.id = l.influencer_id WHERE l.id = ?').get(req.params.id);
+  if (!look) return res.status(404).json({ status: 'error', message: 'Look not found' });
+  const closetItems = db.prepare('SELECT * FROM closet_items WHERE user_id = ?').all(req.user.id);
+  const descs = JSON.parse(look.item_descriptions || '[]');
+  const matched = matchAgainstCloset(descs, closetItems);
+  res.json({ ...look, item_descriptions: descs, pieces: matched, ownedCount: matched.filter((m) => m.owned).length, totalCount: matched.length });
+});
+
+app.get('/api/trending', requireAuth, (req, res) => {
+  const looks = db.prepare('SELECT l.*, i.handle FROM looks l JOIN influencers i ON i.id = l.influencer_id WHERE l.trending = 1').all();
+  res.json(looks.map((l) => ({ ...l, item_descriptions: JSON.parse(l.item_descriptions || '[]') })));
+});
+
+app.get('/api/notifications', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id));
+});
+
+// ---------- gap analysis ----------
+
+function candidateImpact(closetItems, gapItem) {
+  const tags = JSON.parse(gapItem.occasion_tags || '[]');
+  const complementaryCategories = { Top: ['Bottom', 'Shoes', 'Bag'], Bottom: ['Top', 'Shoes', 'Bag'], Shoes: ['Top', 'Bottom', 'Bag'], Bag: ['Top', 'Bottom', 'Shoes'], Dress: ['Shoes', 'Bag'], Outerwear: ['Top', 'Bottom'] };
+  const needed = complementaryCategories[gapItem.category] || [];
+  let count = 0;
+  for (const tag of tags) {
+    for (const item of closetItems) {
+      if (needed.includes(item.category) && JSON.parse(item.occasion_tags || '[]').includes(tag)) count++;
     }
+  }
+  return count;
+}
 
-    const finalAmount = amount ? Number(amount) : loan.amount;
-    const pool = selectFundingPool(finalAmount);
-    if (!pool) return res.status(400).json({ status: 'error', message: 'No lender capacity available right now.' });
+app.get('/api/gap', requireAuth, (req, res) => {
+  const closetItems = db.prepare('SELECT * FROM closet_items WHERE user_id = ?').all(req.user.id);
+  const gapItems = db.prepare('SELECT * FROM gap_items').all();
+  const scored = gapItems.map((g) => ({ ...g, occasion_tags: JSON.parse(g.occasion_tags || '[]'), unlocked: candidateImpact(closetItems, g) }));
+  scored.sort((a, b) => b.unlocked - a.unlocked);
+  res.json(scored[0] || null);
+});
 
-    const installmentAmount = Math.round((finalAmount + loan.fee) / loan.tenure_months);
-    const dueOffsets = Array.from({ length: loan.tenure_months }, (_, i) => (i + 1) * 30);
+app.get('/api/gap/:id/price', requireAuth, (req, res) => {
+  const gapItem = db.prepare('SELECT * FROM gap_items WHERE id = ?').get(req.params.id);
+  if (!gapItem) return res.status(404).json({ status: 'error', message: 'Item not found' });
+  const options = [
+    { platform: 'Meesho', price: gapItem.price_meesho, delivery: '3 days' },
+    { platform: 'Ajio', price: gapItem.price_ajio, delivery: '2 days' },
+    { platform: 'Myntra', price: gapItem.price_myntra, delivery: '4 days' },
+  ].sort((a, b) => a.price - b.price);
+  const savings = options[options.length - 1].price - options[0].price;
+  res.json({ item: { ...gapItem, occasion_tags: JSON.parse(gapItem.occasion_tags || '[]') }, options, best: options[0], savings });
+});
 
-    db.prepare("UPDATE loans SET amount = ?, pool_id = ?, installment_amount = ?, status = 'active' WHERE id = ?").run(
-      finalAmount,
-      pool.id,
-      installmentAmount,
-      loan.id
-    );
-    fundAndScheduleLoan(loan.id, pool, finalAmount, loan.tenure_months, installmentAmount, dueOffsets);
+app.post('/api/gap/:id/purchase', requireAuth, (req, res) => {
+  const gapItem = db.prepare('SELECT * FROM gap_items WHERE id = ?').get(req.params.id);
+  if (!gapItem) return res.status(404).json({ status: 'error', message: 'Item not found' });
 
-    res.json({ status: 'active', amount: finalAmount });
+  const result = db
+    .prepare(`INSERT INTO closet_items (user_id, category, color_name, color_hex, fabric, vibe, occasion_tags, brand, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(req.user.id, gapItem.category, gapItem.name, gapItem.color_hex, 'Blend', 'Versatile', gapItem.occasion_tags, 'Meesho', gapItem.price_meesho);
+
+  const closetItems = db.prepare('SELECT * FROM closet_items WHERE user_id = ?').all(req.user.id);
+  const tags = JSON.parse(gapItem.occasion_tags || '[]');
+  const unlockedOutfits = tags.flatMap((occ) => buildOutfitCombos(closetItems, occ).filter((c) => c.matchScore === 100)).slice(0, 6);
+
+  res.status(201).json({ status: 'ok', newItemId: result.lastInsertRowid, unlockedOutfits });
+});
+
+// ---------- chat ----------
+
+function occasionFromMessage(message) {
+  const m = message.toLowerCase();
+  if (/(dinner|date|rooftop|romantic)/.test(m)) return 'Date Night';
+  if (/(office|work|meeting)/.test(m)) return 'Office';
+  if (/(wedding|shaadi)/.test(m)) return 'Wedding Guest';
+  if (/(festive|diwali|puja|navratri)/.test(m)) return 'Festive';
+  if (/(travel|trip|flight|vacation)/.test(m)) return 'Travel';
+  if (/(gym|workout|yoga)/.test(m)) return 'Gym';
+  if (/(home|wfh|lounge)/.test(m)) return 'WFH';
+  if (/(party|club|night out)/.test(m)) return 'Party';
+  return null;
+}
+
+function describeItem(item) {
+  return `your ${item.color_name.toLowerCase()} ${item.fabric ? item.fabric.toLowerCase() + ' ' : ''}${item.category.toLowerCase()}`;
+}
+
+async function generateChatReply(user, message, closetItems) {
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      const closetSummary = closetItems.map((i) => `${i.category}: ${i.color_name} ${i.fabric || ''} (${JSON.parse(i.occasion_tags || '[]').join(', ')})`).join('\n');
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-3-5-haiku-20241022',
+          max_tokens: 250,
+          system: `You are "Your Fairy Godmother", a warm, witty personal stylist. Speak in short, stylish sentences with light emoji. The user's closet:\n${closetSummary}\n\nAlways reference specific real items from their closet by description when recommending outfits. Never invent items not in the list.`,
+          messages: [{ role: 'user', content: message }],
+        }),
+      });
+      const json = await resp.json();
+      const text = json.content?.[0]?.text;
+      if (text) return text;
+    } catch (err) {
+      // fall through to rule-based
+    }
+  }
+
+  const occasion = occasionFromMessage(message);
+  if (occasion) {
+    const combos = buildOutfitCombos(closetItems, occasion);
+    if (combos.length && combos[0].items.length) {
+      const names = combos[0].items.map((i) => describeItem(i));
+      const joined = names.length > 1 ? names.slice(0, -1).join(', ') + ' with ' + names[names.length - 1] : names[0];
+      return `For ${occasion.toLowerCase()}, try ${joined}. ${combos[0].missingItem ? `You're just missing ${combos[0].missingItem} to complete it. ✨` : "It's a full look already in your closet. ✨"}`;
+    }
+    return `I don't have quite enough in your closet tagged for ${occasion.toLowerCase()} yet — add a few pieces and I'll style it in seconds. 💫`;
+  }
+
+  const favorites = [...closetItems].sort((a, b) => b.times_worn - a.times_worn).slice(0, 2);
+  if (favorites.length) {
+    return `Tell me the occasion and I'll build the look! In the meantime, ${describeItem(favorites[0])} is one of your most-worn pieces — always a safe, stylish bet. 💕`;
+  }
+  return "Add a few pieces to your closet and I'll start styling you immediately! 💫";
+}
+
+app.get('/api/chat', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM chat_messages WHERE user_id = ? ORDER BY created_at ASC').all(req.user.id));
+});
+
+app.post('/api/chat', requireAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({ status: 'error', message: 'Message required' });
+
+    db.prepare("INSERT INTO chat_messages (user_id, role, content) VALUES (?, 'user', ?)").run(req.user.id, message);
+    const closetItems = db.prepare('SELECT * FROM closet_items WHERE user_id = ?').all(req.user.id);
+    const reply = await generateChatReply(req.user, message, closetItems);
+    db.prepare("INSERT INTO chat_messages (user_id, role, content) VALUES (?, 'assistant', ?)").run(req.user.id, reply);
+
+    res.json({ reply });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
-});
-
-app.get('/api/ops/collections', (req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT i.id, i.amount, i.due_offset_days, l.created_at AS loan_created_at, l.id AS loan_id, l.borrower_id
-       FROM installments i JOIN loans l ON l.id = i.loan_id
-       WHERE i.status = 'due'`
-    )
-    .all();
-
-  const buckets = { '1-30': { amount: 0, count: 0 }, '31-60': { amount: 0, count: 0 }, '60+': { amount: 0, count: 0 } };
-  const overdueList = [];
-  const now = Date.now();
-
-  for (const row of rows) {
-    const dueAt = new Date(row.loan_created_at.replace(' ', 'T') + 'Z').getTime() + row.due_offset_days * 86400000;
-    const daysPastDue = Math.floor((now - dueAt) / 86400000);
-    if (daysPastDue <= 0) continue;
-
-    const bucketKey = daysPastDue <= 30 ? '1-30' : daysPastDue <= 60 ? '31-60' : '60+';
-    buckets[bucketKey].amount += row.amount;
-    buckets[bucketKey].count += 1;
-    overdueList.push({ ...row, daysPastDue });
-  }
-
-  const totalOverdue = Object.values(buckets).reduce((s, b) => s + b.amount, 0);
-  const paidCount = db.prepare("SELECT COUNT(*) AS c FROM installments WHERE status = 'paid'").get().c;
-  const overdueCount = overdueList.length;
-  const recoveryRate = paidCount + overdueCount > 0 ? Math.round((paidCount / (paidCount + overdueCount)) * 1000) / 10 : 100;
-
-  overdueList.sort((a, b) => b.daysPastDue - a.daysPastDue);
-
-  res.json({
-    totalOverdue,
-    recoveryRate,
-    buckets,
-    overdue: overdueList.slice(0, 10),
-  });
 });
 
 app.use(express.static(clientDist));
 
 app.get(/^(?!\/api).*/, (req, res) => {
   res.sendFile(path.join(clientDist, 'index.html'));
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled route error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ status: 'error', message: 'Internal server error' });
 });
 
 app.listen(PORT, '0.0.0.0', () => {

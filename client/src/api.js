@@ -1,7 +1,22 @@
-async function request(path, options) {
+function getToken() {
+  return localStorage.getItem('fg_token');
+}
+
+export function setToken(token) {
+  if (token) localStorage.setItem('fg_token', token);
+  else localStorage.removeItem('fg_token');
+}
+
+async function request(path, options = {}) {
+  const token = getToken();
+  const isForm = options.body instanceof FormData;
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: {
+      ...(isForm ? {} : { 'Content-Type': 'application/json' }),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.message || `Request failed (${res.status})`);
@@ -9,27 +24,42 @@ async function request(path, options) {
 }
 
 export const api = {
-  getPools: () => request('/api/pools'),
-  getPool: (id) => request(`/api/pools/${id}`),
+  register: (payload) => request('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }),
+  login: (payload) => request('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }),
+  me: () => request('/api/auth/me'),
 
-  createLender: (payload) => request('/api/lenders', { method: 'POST', body: JSON.stringify(payload) }),
-  getLenders: () => request('/api/lenders'),
-  getLender: (id) => request(`/api/lenders/${id}`),
-  invest: (id, payload) => request(`/api/lenders/${id}/invest`, { method: 'POST', body: JSON.stringify(payload) }),
-  withdraw: (id, payload) => request(`/api/lenders/${id}/withdraw`, { method: 'POST', body: JSON.stringify(payload) }),
+  onboardingStep: (step, data) => request('/api/onboarding/step', { method: 'POST', body: JSON.stringify({ step, data }) }),
 
-  createBorrower: (payload) => request('/api/borrowers', { method: 'POST', body: JSON.stringify(payload) }),
-  getBorrowers: () => request('/api/borrowers'),
-  getBorrower: (id) => request(`/api/borrowers/${id}`),
-  savePan: (id, pan) => request(`/api/borrowers/${id}/pan`, { method: 'POST', body: JSON.stringify({ pan }) }),
-  verifyAadhaar: (id) => request(`/api/borrowers/${id}/aadhaar-otp`, { method: 'POST' }),
+  getCloset: (params = {}) => request(`/api/closet?${new URLSearchParams(params)}`),
+  getClosetItem: (id) => request(`/api/closet/${id}`),
+  wearItem: (id) => request(`/api/closet/${id}/wear`, { method: 'PATCH' }),
+  analyzePhoto: (file) => {
+    const form = new FormData();
+    form.append('photo', file);
+    return request('/api/closet/analyze', { method: 'POST', body: form });
+  },
+  addClosetItem: (payload) => request('/api/closet', { method: 'POST', body: JSON.stringify(payload) }),
 
-  getProducts: () => request('/api/products'),
-  createOrder: (payload) => request('/api/orders', { method: 'POST', body: JSON.stringify(payload) }),
+  getWeather: () => request('/api/weather'),
+  getOccasions: () => request('/api/occasions'),
+  getOutfitsForOccasion: (occasion) => request(`/api/occasions/${encodeURIComponent(occasion)}/outfits`),
+  saveOutfit: (payload) => request('/api/outfits', { method: 'POST', body: JSON.stringify(payload) }),
+  getOutfit: (id) => request(`/api/outfits/${id}`),
+  wearOutfit: (id) => request(`/api/outfits/${id}/wear`, { method: 'POST' }),
+  getMakeup: (outfitId) => request(`/api/outfits/${outfitId}/makeup`),
+  getNails: (outfitId) => request(`/api/outfits/${outfitId}/nails`),
 
-  payInstallment: (id) => request(`/api/installments/${id}/pay`, { method: 'POST' }),
+  getInfluencers: (q) => request(`/api/influencers${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  toggleFollow: (id) => request(`/api/influencers/${id}/follow`, { method: 'POST' }),
+  getFeed: () => request('/api/feed'),
+  getRecreate: (lookId) => request(`/api/looks/${lookId}/recreate`),
+  getTrending: () => request('/api/trending'),
+  getNotifications: () => request('/api/notifications'),
 
-  getOpsQueue: () => request('/api/ops/queue'),
-  opsDecision: (id, payload) => request(`/api/ops/loans/${id}/decision`, { method: 'POST', body: JSON.stringify(payload) }),
-  getCollections: () => request('/api/ops/collections'),
+  getGap: () => request('/api/gap'),
+  getGapPrice: (id) => request(`/api/gap/${id}/price`),
+  purchaseGap: (id) => request(`/api/gap/${id}/purchase`, { method: 'POST' }),
+
+  getChat: () => request('/api/chat'),
+  sendChat: (message) => request('/api/chat', { method: 'POST', body: JSON.stringify({ message }) }),
 };
