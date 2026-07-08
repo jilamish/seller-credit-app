@@ -1,49 +1,52 @@
 import { useEffect, useState } from 'react'
-import './App.css'
+import { api } from './api'
+import SellerForm from './SellerForm'
+import SellerList from './SellerList'
+import SellerDetail from './SellerDetail'
+import LoansView from './LoansView'
 
 function App() {
-  const [health, setHealth] = useState(null)
-  const [error, setError] = useState(null)
-  const [seeding, setSeeding] = useState(false)
+  const [tab, setTab] = useState('sellers')
+  const [sellers, setSellers] = useState([])
+  const [selectedSellerId, setSelectedSellerId] = useState(null)
 
-  const loadHealth = () => {
-    fetch('/api/health')
-      .then((res) => res.json())
-      .then(setHealth)
-      .catch((err) => setError(err.message))
-  }
+  const loadSellers = () => api.getSellers().then(setSellers).catch(() => {})
 
-  useEffect(() => {
-    loadHealth()
-  }, [])
+  useEffect(loadSellers, [])
 
-  const handleSeed = async () => {
-    setSeeding(true)
-    try {
-      await fetch('/api/seed', { method: 'POST' })
-      loadHealth()
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setSeeding(false)
-    }
+  const handleSellerCreated = (id) => {
+    loadSellers()
+    setSelectedSellerId(id)
   }
 
   return (
-    <section style={{ maxWidth: 640, margin: '4rem auto', fontFamily: 'sans-serif' }}>
-      <h1>Seller Credit App</h1>
-      <h2>Backend Health Check</h2>
-      {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
-      {!health && !error && <p>Checking...</p>}
-      {health && (
-        <pre style={{ background: '#f4f4f4', padding: '1rem', borderRadius: 8, overflowX: 'auto' }}>
-          {JSON.stringify(health, null, 2)}
-        </pre>
-      )}
-      <button onClick={handleSeed} disabled={seeding}>
-        {seeding ? 'Seeding...' : 'Seed Sample Data'}
-      </button>
-    </section>
+    <div className="app">
+      <header className="topbar">
+        <h1>SellerCredit</h1>
+        <p className="tagline">Alternative-data credit scoring &amp; lending for small online sellers</p>
+        <nav>
+          <button className={tab === 'sellers' ? 'active' : ''} onClick={() => { setTab('sellers'); setSelectedSellerId(null) }}>
+            Sellers
+          </button>
+          <button className={tab === 'loans' ? 'active' : ''} onClick={() => setTab('loans')}>
+            Loans
+          </button>
+        </nav>
+      </header>
+
+      <main>
+        {tab === 'sellers' && !selectedSellerId && (
+          <>
+            <SellerForm onCreated={handleSellerCreated} />
+            <SellerList sellers={sellers} onSelect={setSelectedSellerId} />
+          </>
+        )}
+        {tab === 'sellers' && selectedSellerId && (
+          <SellerDetail sellerId={selectedSellerId} onBack={() => setSelectedSellerId(null)} />
+        )}
+        {tab === 'loans' && <LoansView />}
+      </main>
+    </div>
   )
 }
 

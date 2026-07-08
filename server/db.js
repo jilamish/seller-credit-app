@@ -52,6 +52,16 @@ db.exec(`
   );
 `);
 
+const lenderCount = db.prepare('SELECT COUNT(*) AS c FROM lenders').get().c;
+if (lenderCount === 0) {
+  const insertLender = db.prepare(
+    `INSERT INTO lenders (name, min_score, max_amount, rate_pct, tenure_months) VALUES (?, ?, ?, ?, ?)`
+  );
+  insertLender.run('QuickCapital', 40, 150000, 19.5, 6);
+  insertLender.run('BridgeFin Partners', 55, 500000, 15.0, 12);
+  insertLender.run('Prime Working Capital', 70, 2000000, 11.5, 18);
+}
+
 export function dbPathInfo() {
   return dbPath;
 }
