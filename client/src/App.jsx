@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { api } from './api'
 import PersonPicker from './PersonPicker'
-import LenderDashboard from './LenderDashboard'
-import BorrowerDashboard from './BorrowerDashboard'
+import BorrowerFlow from './BorrowerFlow'
+import LenderFlow from './LenderFlow'
+import OpsFlow from './OpsFlow'
 import HowItWorks from './HowItWorks'
 
 function App() {
@@ -10,19 +11,16 @@ function App() {
   const [lenderId, setLenderId] = useState(null)
   const [borrowerId, setBorrowerId] = useState(null)
 
-  const switchTab = (next) => {
-    setTab(next)
-  }
-
   return (
     <div className="app">
       <header className="topbar">
         <h1>Community Credit</h1>
         <p className="tagline">A peer-to-peer marketplace for money — lend what you can spare, borrow what you need</p>
         <nav>
-          <button className={tab === 'borrow' ? 'active' : ''} onClick={() => switchTab('borrow')}>Borrow</button>
-          <button className={tab === 'lend' ? 'active' : ''} onClick={() => switchTab('lend')}>Lend</button>
-          <button className={tab === 'how' ? 'active' : ''} onClick={() => switchTab('how')}>How it works</button>
+          <button className={tab === 'borrow' ? 'active' : ''} onClick={() => setTab('borrow')}>Borrow</button>
+          <button className={tab === 'lend' ? 'active' : ''} onClick={() => setTab('lend')}>Lend</button>
+          <button className={tab === 'ops' ? 'active' : ''} onClick={() => setTab('ops')}>Ops &amp; Risk</button>
+          <button className={tab === 'how' ? 'active' : ''} onClick={() => setTab('how')}>How it works</button>
         </nav>
       </header>
 
@@ -30,7 +28,7 @@ function App() {
         {tab === 'borrow' && !borrowerId && (
           <PersonPicker
             title="Get Instant Credit"
-            subtitle="Enter your name to see your trust score and credit limit."
+            subtitle="Enter your name to shop and see your trust score."
             ctaLabel="Continue"
             createFn={api.createBorrower}
             listFn={api.getBorrowers}
@@ -38,7 +36,7 @@ function App() {
           />
         )}
         {tab === 'borrow' && borrowerId && (
-          <BorrowerDashboard borrowerId={borrowerId} onBack={() => setBorrowerId(null)} />
+          <BorrowerFlow borrowerId={borrowerId} onSwitchAccount={() => setBorrowerId(null)} />
         )}
 
         {tab === 'lend' && !lenderId && (
@@ -52,8 +50,10 @@ function App() {
           />
         )}
         {tab === 'lend' && lenderId && (
-          <LenderDashboard lenderId={lenderId} onBack={() => setLenderId(null)} />
+          <LenderFlow lenderId={lenderId} onSwitchAccount={() => setLenderId(null)} />
         )}
+
+        {tab === 'ops' && <OpsFlow />}
 
         {tab === 'how' && <HowItWorks />}
       </main>

@@ -41,22 +41,37 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     trust_score REAL NOT NULL DEFAULT 650,
+    phone_verified INTEGER NOT NULL DEFAULT 1,
+    pan_last4 TEXT,
+    aadhaar_verified INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    mrp REAL NOT NULL,
+    rating REAL NOT NULL,
+    rating_count INTEGER NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS loans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     borrower_id INTEGER NOT NULL,
-    pool_id INTEGER NOT NULL,
+    pool_id INTEGER,
+    product_id INTEGER,
     amount REAL NOT NULL,
+    fee REAL NOT NULL DEFAULT 0,
     purpose TEXT,
+    plan_label TEXT,
     tenure_months INTEGER NOT NULL,
     installment_amount REAL NOT NULL,
-    total_repayable REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (borrower_id) REFERENCES borrowers(id) ON DELETE CASCADE,
-    FOREIGN KEY (pool_id) REFERENCES pools(id) ON DELETE CASCADE
+    FOREIGN KEY (pool_id) REFERENCES pools(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
   );
 
   CREATE TABLE IF NOT EXISTS loan_fundings (
@@ -99,6 +114,13 @@ if (poolCount === 0) {
   insertPool.run('Steady Saver', 'A', 10.0, 6);
   insertPool.run('Balanced Growth', 'B', 13.5, 9);
   insertPool.run('High Yield', 'C', 16.5, 12);
+}
+
+const productCount = db.prepare('SELECT COUNT(*) AS c FROM products').get().c;
+if (productCount === 0) {
+  db.prepare(
+    `INSERT INTO products (name, price, mrp, rating, rating_count) VALUES (?, ?, ?, ?, ?)`
+  ).run('Cotton Anarkali Kurti Set with Dupatta', 549, 1299, 4.3, 12480);
 }
 
 export function dbPathInfo() {

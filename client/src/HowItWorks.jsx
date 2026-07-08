@@ -18,6 +18,13 @@ export default function HowItWorks() {
         <div><span className="check">✓</span> <b>Building credit.</b> Every on-time repayment raises a borrower's trust score and future limit.</div>
       </div>
 
+      <div className="divider-label">Common questions</div>
+      <div className="presets" style={{ marginBottom: '1.25rem' }}>
+        <span className="tag">Is my capital guaranteed?</span>
+        <span className="tag">What if a borrower defaults?</span>
+        <span className="tag">Lending limits?</span>
+      </div>
+
       <div className="disclaimer">
         This is a hackathon prototype demonstrating the lending mechanics — not a regulated financial product. A real version would require RBI NBFC-P2P registration, KYC/AML checks, and escrow banking infrastructure.
       </div>
